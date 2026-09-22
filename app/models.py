@@ -11,6 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # 有限浮点数（拒绝 NaN / Infinity），用于时滞候选与容差等标量参数
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 
+# 异常段处置状态：仅允许 open -> acknowledged -> resolved 单向流转
+SegmentStatus = Literal["open", "acknowledged", "resolved"]
+SEGMENT_STATUSES: tuple[str, ...] = ("open", "acknowledged", "resolved")
+
 
 def parse_timestamp(value: object) -> datetime:
     """把时间戳解析为 UTC aware datetime。
@@ -339,6 +343,22 @@ class AnomalySegment(BaseModel):
         default=0,
         description="该异常区间所属采样分段编号（从 0 开始）；未启用断档感知时恒为 0",
     )
+    status: SegmentStatus = Field(
+        default="open",
+        description="处置状态：open（待处理）→ acknowledged（已确认）→ resolved（已解决）",
+    )
+    note: str | None = Field(default=None, description="处置备注；未填写为 null")
+    updated_at: str | None = Field(
+        default=None, description="处置状态最近一次变更时间（UTC ISO-8601）；初始为检测创建时间"
+    )
+
+
+class SegmentStatusCounts(BaseModel):
+    """一条检测的各处置状态异常段计数。"""
+
+    open: int = 0
+    acknowledged: int = 0
+    resolved: int = 0
 
 
 class GapBoundary(BaseModel):
@@ -412,6 +432,10 @@ class DetectResponse(DetectSummary):
     created_at: str
     segments: list[AnomalySegment]
     points: list[AnnotatedPoint] | None = None
+    status_counts: SegmentStatusCounts = Field(
+        default_factory=SegmentStatusCounts,
+        description="各处置状态（open / acknowledged / resolved）的异常段计数",
+    )
 
     model_config = ConfigDict(extra="ignore")
 
@@ -425,11 +449,43 @@ class DetectionListItem(BaseModel):
     anomaly_point_count: int
     threshold: float
     window_size: int
+    status_counts: SegmentStatusCounts = Field(
+        default_factory=SegmentStatusCounts,
+        description="各处置状态（open / acknowledged / resolved）的异常段计数",
+    )
 
 
 class DetectionListResponse(BaseModel):
     items: list[DetectionListItem]
     total: int
+
+
+class SegmentStatusUpdateRequest(BaseModel):
+    """异常段处置状态更新请求。"""
+
+    status: SegmentStatus = Field(
+        description="目标处置状态；仅允许 open -> acknowledged -> resolved 的下一状态"
+    )
+    note: str | None = Field(
+        default=None,
+        max_length=4096,
+        description=(
+            "处置备注（最长 4096 字符）；省略时本次跳转清空备注。"
+            "重复提交与当前相同的状态为幂等操作，note / updated_at 均不变"
+        ),
+    )
+
+
+class SegmentStatusResponse(BaseModel):
+    """异常段处置状态。"""
+
+    detection_id: str
+    segment_index: int
+    status: SegmentStatus
+    note: str | None = None
+    updated_at: str
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class IncidentAggregateRequest(BaseModel):

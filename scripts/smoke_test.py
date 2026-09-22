@@ -1581,6 +1581,226 @@ def _exercise_api(client: "TestClient") -> None:
     )
 
 
+def test_segment_status_workflow(tmp_db: str = "/tmp/tsad_segments_smoke.db") -> None:
+    """异常段处置工作流：状态机 / 幂等 / 409 / 404 / 计数回显 / 持久化。"""
+    import os
+
+    if os.path.exists(tmp_db):
+        os.remove(tmp_db)
+    os.environ["DB_PATH"] = tmp_db
+
+    from app import database
+
+    database.DB_PATH = tmp_db
+    database.init_db(tmp_db)
+
+    with TestClient(app) as client:
+        # 两个间隔足够远的尖刺 -> 2 个异常段
+        points = [
+            {"timestamp": f"2026-09-20T08:{i:02d}:00", "value": 10.0 + (i % 2) * 0.05}
+            for i in range(30)
+        ]
+        points[5] = {"timestamp": "2026-09-20T08:05:00", "value": 50.0}
+        points[25] = {"timestamp": "2026-09-20T08:25:00", "value": -30.0}
+        r = client.post(
+            "/api/v1/detections",
+            json={"series_id": "seg-wf", "window_size": 10, "min_window": 3, "points": points},
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        did = body["id"]
+        assert body["anomaly_segment_count"] == 2
+        # 创建后每段默认 open，updated_at 为检测创建时间
+        assert all(
+            s["status"] == "open" and s["note"] is None and s["updated_at"] == body["created_at"]
+            for s in body["segments"]
+        )
+        assert body["status_counts"] == {"open": 2, "acknowledged": 0, "resolved": 0}
+
+        def set_status(index: int, payload: dict):
+            return client.post(
+                f"/api/v1/detections/{did}/segments/{index}/status", json=payload
+            )
+
+        # 非法跳转 open -> resolved -> 409，状态不变
+        r = set_status(0, {"status": "resolved"})
+        assert r.status_code == 409 and "open" in r.text and "resolved" in r.text
+        r = client.get(f"/api/v1/detections/{did}")
+        assert r.json()["segments"][0]["status"] == "open"
+
+        # 非法状态值 -> 422；note 超长 -> 422
+        assert set_status(0, {"status": "closed"}).status_code == 422
+        assert set_status(0, {"status": "acknowledged", "note": "x" * 4097}).status_code == 422
+
+        # open -> acknowledged（带备注）
+        r = set_status(0, {"status": "acknowledged", "note": "值班确认中"})
+        assert r.status_code == 200, r.text
+        ack = r.json()
+        assert ack["status"] == "acknowledged" and ack["note"] == "值班确认中"
+        assert ack["detection_id"] == did and ack["segment_index"] == 0
+        updated_at_ack = ack["updated_at"]
+
+        # 重复提交 acknowledged 幂等：200、note/updated_at 不变
+        r = set_status(0, {"status": "acknowledged"})
+        assert r.status_code == 200
+        assert r.json()["status"] == "acknowledged"
+        assert r.json()["note"] == "值班确认中"
+        assert r.json()["updated_at"] == updated_at_ack
+
+        # acknowledged -> open 回退 -> 409
+        r = set_status(0, {"status": "open"})
+        assert r.status_code == 409 and "acknowledged" in r.text
+
+        # acknowledged -> resolved（省略 note，跳转后备注清空）
+        r = set_status(0, {"status": "resolved"})
+        assert r.status_code == 200 and r.json()["status"] == "resolved"
+        assert r.json()["note"] is None
+        assert r.json()["updated_at"] >= updated_at_ack
+
+        # resolved 后任何变更都 409
+        assert set_status(0, {"status": "acknowledged"}).status_code == 409
+        assert set_status(0, {"status": "resolved"}).status_code == 200  # 同态幂等仍 200
+
+        # 另一段独立流转：open -> acknowledged，计数随之变化
+        r = set_status(1, {"status": "acknowledged", "note": "第二段"})
+        assert r.status_code == 200
+        r = client.get(f"/api/v1/detections/{did}")
+        detail = r.json()
+        assert detail["status_counts"] == {"open": 0, "acknowledged": 1, "resolved": 1}
+        assert detail["segments"][0]["status"] == "resolved"
+        assert detail["segments"][1]["status"] == "acknowledged"
+        assert detail["segments"][1]["note"] == "第二段"
+        # include_points=false 仍带处置状态与计数
+        r = client.get(f"/api/v1/detections/{did}", params={"include_points": False})
+        b = r.json()
+        assert b["points"] is None
+        assert b["status_counts"]["resolved"] == 1
+        assert b["segments"][0]["status"] == "resolved"
+
+        # 列表摘要回显计数
+        r = client.get("/api/v1/detections", params={"series_id": "seg-wf"})
+        assert r.status_code == 200 and r.json()["total"] == 1
+        assert r.json()["items"][0]["status_counts"] == {
+            "open": 0,
+            "acknowledged": 1,
+            "resolved": 1,
+        }
+
+        # 404：未知检测、段序号越界（含负数）
+        r = client.post(
+            "/api/v1/detections/no-such-id/segments/0/status", json={"status": "acknowledged"}
+        )
+        assert r.status_code == 404
+        assert set_status(2, {"status": "acknowledged"}).status_code == 404
+        assert set_status(-1, {"status": "acknowledged"}).status_code == 404
+
+        # 无异常段的检测：计数全 0；操作其段 -> 404
+        flat = [
+            {"timestamp": f"2026-09-20T09:{i:02d}:00", "value": 10.0 + 0.01 * (i % 2)}
+            for i in range(10)
+        ]
+        r = client.post(
+            "/api/v1/detections",
+            json={"series_id": "seg-wf-empty", "window_size": 5, "min_window": 3, "points": flat},
+        )
+        assert r.status_code == 201
+        empty_id = r.json()["id"]
+        assert r.json()["anomaly_segment_count"] == 0
+        assert r.json()["status_counts"] == {"open": 0, "acknowledged": 0, "resolved": 0}
+        r = client.get(f"/api/v1/detections/{empty_id}")
+        assert r.json()["segments"] == []
+        r = client.post(
+            f"/api/v1/detections/{empty_id}/segments/0/status", json={"status": "acknowledged"}
+        )
+        assert r.status_code == 404
+
+        # 事件聚合对处置字段无感知（仍只读、可正常工作）
+        r = client.post(
+            "/api/v1/incidents/aggregate",
+            json={"detection_ids": [did, empty_id], "gap_seconds": 0},
+        )
+        assert r.status_code == 200
+
+    # 重启等价校验：重新打开库后状态仍在
+    from app import database as db2
+
+    rows = {row["segment_index"]: row for row in db2.get_segment_statuses(did)}
+    assert rows[0]["status"] == "resolved"
+    assert rows[1]["status"] == "acknowledged" and rows[1]["note"] == "第二段"
+    assert db2.get_status_counts([did])[did] == {
+        "open": 0,
+        "acknowledged": 1,
+        "resolved": 1,
+    }
+
+    print("✓ 异常段处置工作流测试通过：状态机 / 幂等 / 409 / 404 / 计数回显 / 持久化")
+
+
+def test_segment_status_legacy_backfill(tmp_db: str = "/tmp/tsad_legacy_smoke.db") -> None:
+    """旧版库（无 segment_status 表）启动时幂等回填 open。"""
+    import json
+    import os
+    import sqlite3
+
+    if os.path.exists(tmp_db):
+        os.remove(tmp_db)
+
+    conn = sqlite3.connect(tmp_db)
+    conn.executescript(
+        """
+        CREATE TABLE detections (
+            id TEXT PRIMARY KEY, series_id TEXT, created_at TEXT NOT NULL,
+            request_params TEXT NOT NULL, result_json TEXT NOT NULL,
+            point_count INTEGER NOT NULL, anomaly_segment_count INTEGER NOT NULL,
+            anomaly_point_count INTEGER NOT NULL, threshold REAL NOT NULL,
+            window_size INTEGER NOT NULL);
+        """
+    )
+    result = {
+        "anomaly_segment_count": 1,
+        "point_count": 10,
+        "anomaly_point_count": 1,
+        "threshold": 3.0,
+        "window_size": 5,
+        "segments": [{}],
+    }
+    conn.execute(
+        "INSERT INTO detections VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            "legacy",
+            None,
+            "2026-01-01T00:00:00+00:00",
+            "{}",
+            json.dumps(result),
+            10,
+            1,
+            1,
+            3.0,
+            5,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    os.environ["DB_PATH"] = tmp_db
+    from app import database
+
+    database.DB_PATH = tmp_db
+    database.init_db(tmp_db)
+    rows = database.get_segment_statuses("legacy")
+    assert len(rows) == 1
+    assert rows[0]["status"] == "open"
+    assert rows[0]["updated_at"] == "2026-01-01T00:00:00+00:00"
+    # 回填后可正常流转
+    upd = database.set_segment_status("legacy", 0, "acknowledged", note="迁移后确认")
+    assert upd["status"] == "acknowledged"
+    # 再次 init_db 不覆盖已有状态
+    database.init_db(tmp_db)
+    assert database.get_segment_statuses("legacy")[0]["status"] == "acknowledged"
+
+    print("✓ 历史检测异常段状态回填测试通过")
+
+
 if __name__ == "__main__":
     test_algorithm_spikes_and_shift()
     test_constant_baseline()
@@ -1611,4 +1831,6 @@ if __name__ == "__main__":
     test_resample_max_gap_boundary_and_cap()
     test_resample_separate_missing_runs()
     test_api_end_to_end()
+    test_segment_status_workflow()
+    test_segment_status_legacy_backfill()
     print("\n全部冒烟测试通过 ✅")

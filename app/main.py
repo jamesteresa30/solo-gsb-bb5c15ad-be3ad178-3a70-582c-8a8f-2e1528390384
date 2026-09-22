@@ -27,6 +27,8 @@ from .models import (
     LagCorrelationResponse,
     ResampleRequest,
     ResampleResponse,
+    SegmentStatusUpdateRequest,
+    SegmentStatusResponse,
     TrendRequest,
     TrendResponse,
     parse_timestamp,
@@ -51,11 +53,14 @@ app = FastAPI(
         "以 Pearson 相关系数评估各时滞下的关联强度并选出 best_lag；"
         "事件聚合读取已保存检测的异常段，按时间重叠或间隔不超过 gap_seconds "
         "跨检测聚合为事件（只读，不修改检测记录）。"
+        "异常段处置工作流为每条已保存检测的异常段持久化 status / note / updated_at，"
+        "仅允许 open → acknowledged → resolved 单向流转，重复提交幂等，非法跳转返回 409，"
+        "检测详情与列表摘要回显各状态计数。"
         "重采样接口在首末样本闭区间内输出与 anchor_time 对齐的等间隔网格（整数微秒计算），"
         "原始样本落点标 observed，其余点按 linear/previous 补值，"
         "前后样本间隔超过 max_gap_seconds 时标 missing（null），不跨断档外推。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -109,6 +114,29 @@ def _strip_points(result: dict) -> dict:
     return {k: v for k, v in result.items() if k != "points"}
 
 
+def _empty_status_counts() -> dict:
+    return {"open": 0, "acknowledged": 0, "resolved": 0}
+
+
+def _attach_segment_status(record: dict, result: dict) -> dict:
+    """把持久化的处置状态（status/note/updated_at）合并到结果的各异常段上。"""
+    statuses = {row["segment_index"]: row for row in database.get_segment_statuses(record["id"])}
+    counts = _empty_status_counts()
+    for idx, seg in enumerate(result.get("segments", [])):
+        row = statuses.get(idx)
+        if row is None:  # 理论上不会缺行（init_db 会回填），防御性兜底
+            seg["status"] = "open"
+            seg["note"] = None
+            seg["updated_at"] = record["created_at"]
+        else:
+            seg["status"] = row["status"]
+            seg["note"] = row["note"]
+            seg["updated_at"] = row["updated_at"]
+        counts[seg["status"]] += 1
+    result["status_counts"] = counts
+    return result
+
+
 @app.post("/api/v1/detections", response_model=DetectResponse, status_code=201, tags=["检测"])
 def create_detection(req: DetectRequest) -> dict:
     """提交序列进行异常检测，结果持久化后返回（含检测 ID）。"""
@@ -140,9 +168,52 @@ def create_detection(req: DetectRequest) -> dict:
     created_at = database.insert_detection(detection_id, req.series_id, request_params, result)
 
     body = {"id": detection_id, "series_id": req.series_id, "created_at": created_at, **result}
+    # 新检测的异常段一律为 open（仅回显，不改变已持久化的算法结果）
+    for seg in body["segments"]:
+        seg["status"] = "open"
+        seg["note"] = None
+        seg["updated_at"] = created_at
+    body["status_counts"] = {
+        "open": len(body["segments"]),
+        "acknowledged": 0,
+        "resolved": 0,
+    }
     if not req.include_points:
         body = {k: v for k, v in body.items() if k != "points"}
     return body
+
+
+@app.post(
+    "/api/v1/detections/{detection_id}/segments/{segment_index}/status",
+    response_model=SegmentStatusResponse,
+    tags=["异常段处置"],
+)
+def update_segment_status(
+    detection_id: str, segment_index: int, req: SegmentStatusUpdateRequest
+) -> dict:
+    """更新某条检测中指定异常段的处置状态。
+
+    - 状态机仅允许 ``open -> acknowledged -> resolved``，不可回退或跨级；
+    - 重复提交与当前相同的状态为**幂等**操作：返回 200 与当前状态，
+      ``note`` / ``updated_at`` 均不变；
+    - 非法跳转（如 open 直接 resolved、resolved 再变更）返回 **409**；
+    - 检测不存在或段序号越界返回 **404**；请求体非法状态值返回 422。
+    """
+    try:
+        updated = database.set_segment_status(
+            detection_id=detection_id,
+            segment_index=segment_index,
+            target_status=req.status,
+            note=req.note,
+        )
+    except database.SegmentStatusConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if updated is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"检测或异常段不存在: detection_id={detection_id}, segment_index={segment_index}",
+        )
+    return updated
 
 
 @app.get("/api/v1/detections/{detection_id}", response_model=DetectResponse, tags=["检测"])
@@ -152,11 +223,11 @@ def get_detection(
         default=True, description="是否返回逐点注解（区间、基线、分数始终返回）"
     ),
 ) -> dict:
-    """按 ID 查询历史检测结果。"""
+    """按 ID 查询历史检测结果（含各异常段处置状态与状态计数）。"""
     record = database.get_detection(detection_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"检测结果不存在: {detection_id}")
-    result = record["result"]
+    result = _attach_segment_status(record, record["result"])
     if not include_points:
         result = _strip_points(result)
     return {
@@ -173,8 +244,11 @@ def list_detections(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> dict:
-    """列出历史检测（摘要信息），可按 series_id 过滤。"""
+    """列出历史检测（摘要信息，含各处置状态计数），可按 series_id 过滤。"""
     items, total = database.list_detections(series_id=series_id, limit=limit, offset=offset)
+    counts_by_id = database.get_status_counts([item["id"] for item in items])
+    for item in items:
+        item["status_counts"] = counts_by_id.get(item["id"], _empty_status_counts())
     return {"items": items, "total": total}
 
 

@@ -1,8 +1,8 @@
 # 时间序列异常检测与趋势扫描 API
 
-基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测、趋势扫描、双序列时滞关联扫描、跨检测事件聚合与无状态等间隔重采样服务。
+基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测、趋势扫描、双序列时滞关联扫描、跨检测事件聚合、**异常段处置工作流**与无状态等间隔重采样服务。
 
-接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。时滞关联扫描接口对 **driver / response 双序列**按候选时滞平移并做**一对一最近邻匹配**，以 **Pearson 相关系数**评估各时滞下的关联强度并选出 `best_lag`（无状态，不入库）。事件聚合接口读取 1~50 条**已保存检测**的异常段，按**时间重叠或间隔不超过 `gap_seconds`** 跨检测（也包括同一检测的相邻段）聚合为事件，返回事件起止、覆盖序列、段数、最大绝对 z 分数与稳定排序的成员定位（只读，不修改检测记录）。重采样接口在**首末样本闭区间**内输出与 `anchor_time` 对齐的等间隔网格（网格时间按**整数微秒**计算，最多 10000 点）：原始样本恰落网格标 `observed`，其余点仅在前后样本间隔不超过 `max_gap_seconds` 时按 `linear` / `previous` 补值（`interpolated`），否则 `value=null`、`source=missing`，不跨断档补值、不外推（无状态，不入库）。
+接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。每条已保存检测的异常段都持久化独立的**处置状态**（`open` / `acknowledged` / `resolved`）、备注与更新时间，仅允许 `open → acknowledged → resolved` 单向流转（重复提交幂等、非法跳转 409），检测详情与列表摘要回显各状态计数；检测算法本身保持不变。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。时滞关联扫描接口对 **driver / response 双序列**按候选时滞平移并做**一对一最近邻匹配**，以 **Pearson 相关系数**评估各时滞下的关联强度并选出 `best_lag`（无状态，不入库）。事件聚合接口读取 1~50 条**已保存检测**的异常段，按**时间重叠或间隔不超过 `gap_seconds`** 跨检测（也包括同一检测的相邻段）聚合为事件，返回事件起止、覆盖序列、段数、最大绝对 z 分数与稳定排序的成员定位（只读，不修改检测记录）。重采样接口在**首末样本闭区间**内输出与 `anchor_time` 对齐的等间隔网格（网格时间按**整数微秒**计算，最多 10000 点）：原始样本恰落网格标 `observed`，其余点仅在前后样本间隔不超过 `max_gap_seconds` 时按 `linear` / `previous` 补值（`interpolated`），否则 `value=null`、`source=missing`，不跨断档补值、不外推（无状态，不入库）。
 
 ## 特性
 
@@ -16,6 +16,7 @@
 - **趋势扫描**：以 `window_size` / `step_size` 滑窗，每窗执行含**重复值方差修正**与**连续性校正**的 Mann-Kendall 检验，并按**实际时间差**计算 Theil-Sen 斜率（值/秒，非等距采样同样适用）；仅当 `p_value ≤ alpha` 且 `|slope| ≥ min_slope` 时标记上升 / 下降趋势；方向相同、时间范围重叠或首尾相接的显著窗口自动合并为趋势区间，返回区间范围、成员窗口、最小 p 值与成员斜率中位数。
 - **时滞关联扫描**：对 driver / response 双序列，按候选 `lag_seconds` 逐个把 driver 时间平移 `+lag`，再按时间顺序做**贪心一对一最近邻匹配**（容差 `match_tolerance_seconds` 内取最近点，等距取较早 response，已匹配点不复用）；仅对**配对数 ≥ min_pairs 且两侧方差非零**的候选计算 Pearson 相关系数，逐候选返回配对数、相关系数、可用状态与不可用原因；`best_lag` 按 |correlation| 最大 → 配对数更多 → |lag| 更小 → lag 更小依次确定，无可用候选时为 `null`。
 - **跨检测事件聚合**：`POST /api/v1/incidents/aggregate` 接收 1~50 个已保存的 `detection_id` 与非负 `gap_seconds`，把各检测的异常段统一按时间排序后顺序扫描——下一段开始时间不晚于当前事件结束时间 `+ gap_seconds`（即**时间重叠、首尾相接或间隔不超过 gap**）即并入同一事件，因此**同一检测的相邻异常段**同样会被合并，邻近关系可链式传递。每个事件返回起止时间、覆盖的 `series_id` / `detection_id`、成员段数、成员中的最大绝对 z 分数，以及按 `(start_time, detection_id, segment_index)` 稳定排序、可回溯到来源段的成员定位。接口只读，不写入或修改任何检测记录。
+- **异常段处置工作流**：每条已保存检测的每个异常段在 SQLite 中独立持久化 `status`（`open` / `acknowledged` / `resolved`）、`note` 与 `updated_at`。`POST /api/v1/detections/{id}/segments/{index}/status` 仅允许 **open → acknowledged → resolved** 单向流转；重复提交当前状态为**幂等**（返回 200，`note` / `updated_at` 不变）；回退、跨级等非法跳转返回 **409**；检测或段序号不存在返回 **404**。`GET` 检测详情在每个异常段上回显 `status` / `note` / `updated_at`，并在顶层与列表摘要中回显 `status_counts`（各状态段数）。历史数据库（旧表结构）启动时自动为已有检测幂等回填 `open` 状态，**检测算法与结果结构保持不变**。
 - **无状态等间隔重采样**：`POST /api/v1/resample` 在**首末样本闭区间**内输出与 `anchor_time` 对齐的等间隔网格，网格时刻 `anchor + k·interval` 全部按**整数微秒**整数运算生成（无浮点累加漂移，最多 10000 点）。原始样本恰落某网格点时标 `observed` 直取样本值；其余点仅当其前后两个样本的间隔 **≤ `max_gap_seconds`** 时补值——`linear` 按实际时间差线性插值、`previous` 取前一样本（前向填充），统一标 `interpolated`；前后样本间隔超限则 `value=null`、`source=missing`，**不跨断档补值，也不向首末样本之外外推**。响应返回三类点计数（`observed_count` / `interpolated_count` / `missing_count`）与逐点结果，并把连续出现的 missing 点汇总为**连续缺口范围** `missing_ranges`（起止网格点、点数、包围样本及其实测间隔）。
 - **可解释结果**：每段返回基线窗口、最大/平均 |z|、全部触发点及中文原因说明。
 - **持久化检索**：SQLite（WAL 模式）保存完整结果，按检测 ID 查询，可按业务 `series_id` 过滤、分页列出。
@@ -41,7 +42,8 @@
 │   ├── request_gap.json            # 断档感知示例请求（两段采样，水位迁移 + 各自尖刺）
 │   ├── request_trends.json         # 趋势扫描示例请求（先升后降，方向切换）
 │   ├── request_lag_correlation.json # 时滞关联示例请求（response 滞后 driver 600 秒）
-│   └── request_resample.json       # 重采样示例请求（6 小时断档，missing + 连续缺口）
+│   ├── request_resample.json       # 重采样示例请求（6 小时断档，missing + 连续缺口）
+│   └── request_segment_status.json # 异常段处置（acknowledged + note）示例请求
 ├── scripts/
 │   └── smoke_test.py  # 算法 + API 端到端冒烟测试
 ├── data/              # SQLite 数据库目录（compose 挂载命名卷）
@@ -52,15 +54,15 @@
 
 ## 快速开始
 
-### 方式一：Docker Compose（推荐）
+### 方式一：Docker Compose（推荐，单条命令启动）
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
 
-服务启动在 <http://localhost:8000>，数据库保存在命名卷 `ts_data` 中。
+服务监听 **8000 端口**：启动后访问 <http://localhost:8000>（Swagger 文档 <http://localhost:8000/docs>），数据库保存在命名卷 `ts_data` 中。停止服务用 `docker compose down`（加 `-v` 同时清空数据）。
 
-验证：
+验证（端口 `8000`）：
 
 ```bash
 curl http://localhost:8000/health
@@ -76,6 +78,12 @@ curl -X POST http://localhost:8000/api/v1/lag-correlation \
 curl -X POST http://localhost:8000/api/v1/resample \
   -H "Content-Type: application/json" \
   -d @examples/request_resample.json
+```
+
+也可以不写 compose 文件、单条命令直接用 Docker 启动（同样是 8000 端口）：
+
+```bash
+docker build -t ts-anomaly-api . && docker run --rm -p 8000:8000 -v ts_data:/app/data ts-anomaly-api
 ```
 
 ### 方式二：本地 Python 运行
@@ -115,9 +123,83 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 查询参数 `include_points`（默认 `true`）控制是否返回逐点注解。
 
+响应在每个异常段上额外回显处置字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `segments[].status` | 处置状态：`open`（待处理，初始值）/ `acknowledged`（已确认）/ `resolved`（已解决） |
+| `segments[].note` | 处置备注字符串；未填写为 `null` |
+| `segments[].updated_at` | 处置状态最近一次变更时间（UTC ISO-8601）；未流转过时为检测创建时间 |
+| `status_counts` | 顶层对象，各状态异常段计数：`{"open": n, "acknowledged": n, "resolved": n}` |
+
 ### `GET /api/v1/detections?series_id=&limit=&offset=` — 列表
 
-按创建时间倒序返回检测摘要，可按 `series_id` 过滤，支持分页。
+按创建时间倒序返回检测摘要，可按 `series_id` 过滤，支持分页。每个摘要项除原字段外带 `status_counts`（各处置状态异常段计数），便于列表页直接展示待办 / 处理中 / 已解决数量。
+
+### `POST /api/v1/detections/{id}/segments/{index}/status` — 更新异常段处置状态
+
+为指定检测（`id`）中指定序号的异常段（`index` 即 `segments[]` 下标，从 **0** 开始）更新处置状态。
+
+请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `status` | string | 必填 | 目标状态，只能是 `open` / `acknowledged` / `resolved` 之一（其他值 422） |
+| `note` | string \| null | `null` | 处置备注，最长 4096 字符；发生实际状态跳转时写入（省略即清空备注） |
+
+状态机与状态码：
+
+- **仅允许 `open → acknowledged → resolved`** 单向流转，不可回退、不可跨级；
+- 请求的目标状态与**当前状态相同**时为**幂等**提交：返回 `200` 与当前状态，`note` / `updated_at` 均不改变（因此重试、超时重发安全）；
+- 非法跳转（如 `open → resolved`、`acknowledged → open`、`resolved → acknowledged`）返回 **409**，错误详情形如 `非法状态跳转: open -> resolved（仅允许 open -> acknowledged -> resolved）`，状态与备注保持不变；
+- 检测 ID 不存在或段序号越界（含负数、`index ≥ anomaly_segment_count`；对没有异常段的检测操作 `0` 同样如此）返回 **404**；请求体缺字段 / 非法枚举 / 备注超长返回 **422**。
+
+成功响应（`200`）：
+
+```json
+{
+  "detection_id": "b601c077...",
+  "segment_index": 0,
+  "status": "acknowledged",
+  "note": "值班已确认，正在排查根因",
+  "updated_at": "2026-09-22T03:10:00.123456+00:00"
+}
+```
+
+典型处置流程（先确认、再解决；备注随每次实际跳转更新）：
+
+```bash
+# 0) 发起检测并记下 id 与异常段序号
+ID=$(curl -s -X POST http://localhost:8000/api/v1/detections \
+  -H "Content-Type: application/json" \
+  -d @examples/request.json | python -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 1) open -> acknowledged（带备注）
+curl -s -X POST "http://localhost:8000/api/v1/detections/$ID/segments/0/status" \
+  -H "Content-Type: application/json" \
+  -d @examples/request_segment_status.json
+
+# 2) 重复提交同一状态：幂等，仍返回 200，note / updated_at 不变
+curl -s -X POST "http://localhost:8000/api/v1/detections/$ID/segments/0/status" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "acknowledged"}'
+
+# 3) 非法跨级 open -> resolved 直接打到另一段 -> 409
+curl -i -X POST "http://localhost:8000/api/v1/detections/$ID/segments/1/status" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "resolved", "note": "直接收尾"}'
+
+# 4) acknowledged -> resolved
+curl -s -X POST "http://localhost:8000/api/v1/detections/$ID/segments/0/status" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "resolved", "note": "回滚发布后恢复"}'
+
+# 5) 详情与列表均回显各状态计数
+curl -s "http://localhost:8000/api/v1/detections/$ID" | python -m json.tool
+curl -s "http://localhost:8000/api/v1/detections" | python -m json.tool
+```
+
+状态持久化在独立的 `segment_status` 表中（与检测结果同库同事务写入）；升级到本版本后，服务启动时自动为历史检测的异常段幂等回填 `open`（`updated_at` 取检测创建时间），不影响原有检测算法与 `segments[]` 的算法字段。
 
 ### `POST /api/v1/trends` — 趋势扫描
 
@@ -529,6 +611,7 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
   "estimated_interval_seconds": null,
   "gap_boundaries": [],
   "sampling_segment_count": 1,
+  "status_counts": {"open": 1, "acknowledged": 0, "resolved": 1},
   "segments": [
     {
       "start_index": 24,
@@ -538,6 +621,9 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
       "point_count": 3,
       "anomaly_point_count": 3,
       "sampling_segment_index": 0,
+      "status": "resolved",
+      "note": "回滚发布后恢复",
+      "updated_at": "2026-09-22T03:12:00.000000+00:00",
       "baseline": {
         "median": 10.05,
         "mad": 0.1,
@@ -661,9 +747,10 @@ pip install -r requirements.txt httpx
 python scripts/smoke_test.py
 ```
 
-测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、时滞关联扫描（一对一最近邻匹配的容差边界 / 等距取较早 / 已匹配点不复用、正/负时滞还原、配对数不足与单侧零方差候选标记、`best_lag` 依次按 |corr| → 配对数 → |lag| → lag 决胜、无可用候选时为 null）、事件聚合（时间重叠 / 首尾相接 / 间隔等于与略大于 `gap_seconds` 的边界、同一检测相邻段合并、链式传递合并、成员按 `(start_time, detection_id, segment_index)` 稳定排序与段序号回溯、`series_id` 覆盖、无异常检测贡献 0 段与全空结果）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳，时滞关联接口的空候选 / 非有限时滞或容差 / 负容差 / `min_pairs < 2` / 空序列 / 单侧重复时间戳，事件聚合接口的空 ID 列表 / 超过 50 个 ID / 重复 ID / 负间隔 / 非有限间隔 / 未知 ID 返回 404 / 聚合后检测记录不变的只读保证）、无状态重采样（anchor 对齐整数微秒网格与首末闭区间 / 不外推、observed/interpolated/missing 三类分类与三类点计数、linear 按时间比例插值与 previous 前向填充、超 `max_gap_seconds` 断档返回 null 与连续缺口范围（包围样本与实测间隔）、多处独立缺口分别报告、亚秒整微秒网格与半微秒间隔拒绝、`max_gap` 等号边界与 `max_gap=0`、单样本空网格、网格 10000 点上限与越界 422，以及接口层的重复时间戳 / 间隔非整微秒或非有限或非正 / `max_gap` 负或非有限 / 空 points / 非法 method / anchor 无法解析或非有限 / value 非有限 / 网格超上限等 422 校验与乱序、epoch 秒毫秒 anchor 兼容）。
+测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、时滞关联扫描（一对一最近邻匹配的容差边界 / 等距取较早 / 已匹配点不复用、正/负时滞还原、配对数不足与单侧零方差候选标记、`best_lag` 依次按 |corr| → 配对数 → |lag| → lag 决胜、无可用候选时为 null）、事件聚合（时间重叠 / 首尾相接 / 间隔等于与略大于 `gap_seconds` 的边界、同一检测相邻段合并、链式传递合并、成员按 `(start_time, detection_id, segment_index)` 稳定排序与段序号回溯、`series_id` 覆盖、无异常检测贡献 0 段与全空结果）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳，时滞关联接口的空候选 / 非有限时滞或容差 / 负容差 / `min_pairs < 2` / 空序列 / 单侧重复时间戳，事件聚合接口的空 ID 列表 / 超过 50 个 ID / 重复 ID / 负间隔 / 非有限间隔 / 未知 ID 返回 404 / 聚合后检测记录不变的只读保证）、异常段处置工作流（新检测段落默认 open 与创建时间回显、open→acknowledged→resolved 正常流转与备注更新 / 清空、同态重复提交幂等不改 note 与 updated_at、跨级 / 回退 / resolved 后变更返回 409 且状态不变、非法状态值与超长备注 422、未知检测与越界 / 负段序号 404、详情与列表摘要 `status_counts` 计数随流转更新、无异常段检测计数全 0 且操作 404、事件聚合不受处置字段影响、重新开库后状态持久化、旧版库启动幂等回填 open 后可正常流转且重复 init 不覆盖）、无状态重采样（anchor 对齐整数微秒网格与首末闭区间 / 不外推、observed/interpolated/missing 三类分类与三类点计数、linear 按时间比例插值与 previous 前向填充、超 `max_gap_seconds` 断档返回 null 与连续缺口范围（包围样本与实测间隔）、多处独立缺口分别报告、亚秒整微秒网格与半微秒间隔拒绝、`max_gap` 等号边界与 `max_gap=0`、单样本空网格、网格 10000 点上限与越界 422，以及接口层的重复时间戳 / 间隔非整微秒或非有限或非正 / `max_gap` 负或非有限 / 空 points / 非法 method / anchor 无法解析或非有限 / value 非有限 / 网格超上限等 422 校验与乱序、epoch 秒毫秒 anchor 兼容）。
 
 ## 备注
 
 - SQLite 文件随命名卷持久化；删除卷即清空数据：`docker compose down -v`。
+- 异常段处置状态保存在库内独立的 `segment_status` 表（按 `(detection_id, segment_index)` 主键、外键级联删除）；升级旧版库无需手动迁移，服务启动自动回填 `open`。
 - 算法时间复杂度 `O(n · window_size)`，适合单次万级点数以内的离线/准实时检测。

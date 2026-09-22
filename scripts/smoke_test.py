@@ -1581,6 +1581,159 @@ def _exercise_api(client: "TestClient") -> None:
     )
 
 
+def test_segment_status_workflow(tmp_db: str = "/tmp/tsad_smoke_workflow.db") -> None:
+    """异常段处置工作流：单向状态机、幂等重放、409/404/422、详情与列表计数回显。"""
+    import os
+
+    if os.path.exists(tmp_db):
+        os.remove(tmp_db)
+    os.environ["DB_PATH"] = tmp_db
+    from app import database
+
+    database.DB_PATH = tmp_db
+    database.init_db(tmp_db)
+
+    with TestClient(app) as client:
+        # 构造含 2 个异常段的检测：i=25 单点尖刺 + i=30..34 水平偏移
+        values = [10.0 + (0.1 if i % 2 == 0 else -0.1) for i in range(40)]
+        values[25] = 20.0
+        values[30:35] = [16.0, 16.1, 15.9, 16.2, 15.8]
+        payload = {
+            "series_id": "workflow-series",
+            "window_size": 20,
+            "min_window": 5,
+            "threshold": 3.0,
+            "merge_gap": 2,
+            "points": [
+                {"timestamp": f"2026-09-22T08:{i:02d}:00Z", "value": v}
+                for i, v in enumerate(values)
+            ],
+        }
+        r = client.post("/api/v1/detections", json=payload)
+        assert r.status_code == 201, r.text
+        body = r.json()
+        det_id = body["id"]
+        assert body["anomaly_segment_count"] == 2
+        # 新建检测的段默认 open，updated_at 取检测创建时间，计数随响应回显
+        assert body["status_counts"] == {"open": 2, "acknowledged": 0, "resolved": 0}
+        for seg in body["segments"]:
+            assert seg["status"] == "open"
+            assert seg["note"] is None
+            assert seg["updated_at"] == body["created_at"]
+
+        url = lambda idx: f"/api/v1/detections/{det_id}/segments/{idx}/status"  # noqa: E731
+
+        # 详情与列表摘要回显计数
+        r = client.get(f"/api/v1/detections/{det_id}")
+        assert r.json()["status_counts"] == {"open": 2, "acknowledged": 0, "resolved": 0}
+        assert [s["status"] for s in r.json()["segments"]] == ["open", "open"]
+        r = client.get("/api/v1/detections", params={"series_id": "workflow-series"})
+        assert r.json()["items"][0]["status_counts"] == {
+            "open": 2, "acknowledged": 0, "resolved": 0,
+        }
+
+        # open → acknowledged（带备注）：合法推进
+        r = client.post(url(0), json={"status": "acknowledged", "note": "已派单排查"})
+        assert r.status_code == 200, r.text
+        ack = r.json()
+        assert ack["outcome"] == "transition"
+        assert ack["status"] == "acknowledged" and ack["note"] == "已派单排查"
+        assert ack["updated_at"] >= body["created_at"]
+        assert ack["status_counts"] == {"open": 1, "acknowledged": 1, "resolved": 0}
+
+        # 幂等重放：相同状态重复提交 → 200 且状态不变；不带 note 时备注与时间均不变
+        r = client.post(url(0), json={"status": "acknowledged"})
+        assert r.status_code == 200
+        replay = r.json()
+        assert replay["outcome"] == "idempotent"
+        assert replay["status"] == "acknowledged"
+        assert replay["note"] == "已派单排查"
+        assert replay["updated_at"] == ack["updated_at"]
+
+        # 幂等重放但附带新备注：仅更新备注（状态不变）
+        r = client.post(url(0), json={"status": "acknowledged", "note": "补充：定位为误报"})
+        assert r.status_code == 200
+        assert r.json()["outcome"] == "idempotent"
+        assert r.json()["status"] == "acknowledged"
+        assert r.json()["note"] == "补充：定位为误报"
+
+        # 非法跳转：回退 acknowledged → open、越级 open → resolved，均 409 且不写入
+        r = client.post(url(0), json={"status": "open"})
+        assert r.status_code == 409 and "acknowledged" in r.text
+        r = client.post(url(1), json={"status": "resolved"})
+        assert r.status_code == 409 and "open" in r.text
+        r = client.get(f"/api/v1/detections/{det_id}")
+        assert [s["status"] for s in r.json()["segments"]] == ["acknowledged", "open"]
+        assert r.json()["segments"][0]["note"] == "补充：定位为误报"
+
+        # acknowledged → resolved：不带 note 时保留旧备注
+        r = client.post(url(0), json={"status": "resolved"})
+        assert r.status_code == 200
+        assert r.json()["outcome"] == "transition"
+        assert r.json()["status"] == "resolved"
+        assert r.json()["note"] == "补充：定位为误报"
+        assert r.json()["status_counts"] == {"open": 1, "acknowledged": 0, "resolved": 1}
+
+        # resolved 后任何跳转（含回退到 acknowledged）均 409；resolved→resolved 幂等
+        r = client.post(url(0), json={"status": "acknowledged"})
+        assert r.status_code == 409
+        r = client.post(url(0), json={"status": "resolved"})
+        assert r.status_code == 200 and r.json()["outcome"] == "idempotent"
+
+        # 第二段完整链路 open → acknowledged → resolved
+        assert client.post(url(1), json={"status": "acknowledged"}).status_code == 200
+        r = client.post(url(1), json={"status": "resolved", "note": "已修复"})
+        assert r.status_code == 200
+        assert r.json()["status_counts"] == {"open": 0, "acknowledged": 0, "resolved": 2}
+
+        # 终态在详情与列表中持久化回显
+        r = client.get(f"/api/v1/detections/{det_id}")
+        final = r.json()
+        assert [s["status"] for s in final["segments"]] == ["resolved", "resolved"]
+        assert final["segments"][1]["note"] == "已修复"
+        assert final["status_counts"] == {"open": 0, "acknowledged": 0, "resolved": 2}
+        r = client.get("/api/v1/detections", params={"series_id": "workflow-series"})
+        assert r.json()["items"][0]["status_counts"] == {
+            "open": 0, "acknowledged": 0, "resolved": 2,
+        }
+
+        # 404：检测不存在 / 段序号越界（含负数）
+        r = client.post(
+            "/api/v1/detections/nonexistent/segments/0/status",
+            json={"status": "acknowledged"},
+        )
+        assert r.status_code == 404
+        r = client.post(url(2), json={"status": "acknowledged"})
+        assert r.status_code == 404
+        r = client.post(url(-1), json={"status": "acknowledged"})
+        assert r.status_code == 404
+
+        # 422：非法状态值 / 备注超长
+        r = client.post(url(1), json={"status": "closed"})
+        assert r.status_code == 422
+        r = client.post(url(1), json={"status": "resolved", "note": "x" * 2001})
+        assert r.status_code == 422
+
+        # 无异常段的检测：任何段序号都 404，计数全 0
+        clean = dict(payload)
+        clean["series_id"] = "workflow-clean"
+        clean["points"] = [
+            {"timestamp": f"2026-09-22T09:{i:02d}:00Z", "value": 1.0 + (i % 2) * 0.05}
+            for i in range(15)
+        ]
+        r = client.post("/api/v1/detections", json=clean)
+        assert r.status_code == 201
+        clean_id = r.json()["id"]
+        assert r.json()["status_counts"] == {"open": 0, "acknowledged": 0, "resolved": 0}
+        r = client.post(
+            f"/api/v1/detections/{clean_id}/segments/0/status",
+            json={"status": "acknowledged"},
+        )
+        assert r.status_code == 404
+
+    print("✓ 异常段处置工作流：状态机 / 幂等 / 409 / 404 / 422 / 计数回显全部正确")
+
+
 if __name__ == "__main__":
     test_algorithm_spikes_and_shift()
     test_constant_baseline()
@@ -1611,4 +1764,5 @@ if __name__ == "__main__":
     test_resample_max_gap_boundary_and_cap()
     test_resample_separate_missing_runs()
     test_api_end_to_end()
+    test_segment_status_workflow()
     print("\n全部冒烟测试通过 ✅")

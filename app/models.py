@@ -339,6 +339,59 @@ class AnomalySegment(BaseModel):
         default=0,
         description="该异常区间所属采样分段编号（从 0 开始）；未启用断档感知时恒为 0",
     )
+    status: Literal["open", "acknowledged", "resolved"] = Field(
+        default="open",
+        description="处置状态：open → acknowledged → resolved 单向流转，新建检测的段恒为 open",
+    )
+    note: str | None = Field(default=None, description="处置备注；未填写时为 null")
+    updated_at: str | None = Field(
+        default=None, description="处置记录最近更新时间（UTC ISO-8601）"
+    )
+
+
+class SegmentStatusCounts(BaseModel):
+    """一条检测的异常段处置状态计数。"""
+
+    open: int = 0
+    acknowledged: int = 0
+    resolved: int = 0
+
+
+class SegmentStatusUpdateRequest(BaseModel):
+    """异常段处置状态提交。"""
+
+    status: Literal["open", "acknowledged", "resolved"] = Field(
+        description=(
+            "目标处置状态。只允许 open → acknowledged → resolved 单向流转；"
+            "提交与当前相同的状态为幂等重放（成功且不改变状态），其余跳转返回 409"
+        )
+    )
+    note: str | None = Field(
+        default=None,
+        max_length=2000,
+        description=(
+            "可选处置备注（≤2000 字符）：合法流转时覆盖旧备注；"
+            "幂等重放时仅在提供非 null 值时更新备注；省略则保留原备注"
+        ),
+    )
+
+
+class SegmentStatusResponse(BaseModel):
+    """异常段处置状态提交结果。"""
+
+    detection_id: str
+    segment_index: int
+    status: Literal["open", "acknowledged", "resolved"]
+    note: str | None
+    updated_at: str = Field(description="处置记录最近更新时间（UTC ISO-8601）")
+    outcome: Literal["transition", "idempotent"] = Field(
+        description="transition=状态发生推进；idempotent=幂等重放（状态未变）"
+    )
+    status_counts: SegmentStatusCounts = Field(
+        description="本次提交后该检测全部异常段的状态计数"
+    )
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class GapBoundary(BaseModel):
@@ -412,6 +465,10 @@ class DetectResponse(DetectSummary):
     created_at: str
     segments: list[AnomalySegment]
     points: list[AnnotatedPoint] | None = None
+    status_counts: SegmentStatusCounts = Field(
+        default_factory=SegmentStatusCounts,
+        description="全部异常段的处置状态计数（open / acknowledged / resolved）",
+    )
 
     model_config = ConfigDict(extra="ignore")
 
@@ -425,6 +482,10 @@ class DetectionListItem(BaseModel):
     anomaly_point_count: int
     threshold: float
     window_size: int
+    status_counts: SegmentStatusCounts = Field(
+        default_factory=SegmentStatusCounts,
+        description="该检测全部异常段的处置状态计数（open / acknowledged / resolved）",
+    )
 
 
 class DetectionListResponse(BaseModel):
